@@ -1,167 +1,296 @@
-//PAYMENT API - POST /api/payment
-
-//Idempotency KeyClient sends a unique key - we cache the response - same key = same response returned, no double charge
- 
-//1. The Request Body (what the client sends)
+// PaymentRequest.cs
 public class PaymentRequest
 {
-    public string IdempotencyKey { get; set; } // unique ID client sends so same payment isn't run twice
-    public decimal Amount         { get; set; }
-    public string Currency        { get; set; }
-    public string ToAccount       { get; set; }
+    public string IdempotencyKey { get; set; }
+    public decimal Amount        { get; set; }
+    public string Currency       { get; set; }
+    public string FromAccount    { get; set; }
+    public string ToAccount      { get; set; }
 }
- 
-//2. In-memory store for idempotency
-// In real life: use Redis or DB. Here we use a static dict for simplicity.
-public static class IdempotencyStore
+
+
+// PaymentResult.cs
+public class PaymentResult
 {
-    // key = IdempotencyKey string, value = the saved response
-    private static readonly Dictionary<string, IActionResult> _cache = new();
-    private static readonly SemaphoreSlim _lock = new(1, 1); // only 1 thread at a time
- 
-    public static async Task<IActionResult?> GetAsync(string key)
+    public string PaymentId { get; set; }
+    public string Status    { get; set; } // "Success" | "Failed"
+    public int    HttpStatusCode { get; set; } // so we can replay the exact same response
+}
+
+
+// Account.cs (entity)
+public class Account
+{
+    public int     Id           { get; set; }
+    public string  AccountNumber{ get; set; }
+    public decimal Balance      { get; set; }
+
+    [Timestamp] // optimistic concurrency token protects balance updates
+    public byte[] RowVersion    { get; set; }
+}
+
+public class Payment
+{
+    public int      Id              { get; set; }
+    public string    PaymentId        { get; set; }
+    public string    IdempotencyKey   { get; set; }
+    public decimal   Amount           { get; set; }
+    public string    Currency         { get; set; }
+    public string    FromAccount      { get; set; }
+    public string    ToAccount        { get; set; }
+    public string    Status           { get; set; }
+    public DateTime  CreatedAt        { get; set; }
+}
+
+
+// IdempotencyStore.cs
+public interface IIdempotencyStore
+{
+    Task<PaymentResult?> GetAsync(string key);
+    Task SetAsync(string key, PaymentResult result, TimeSpan ttl);
+}
+
+public class InMemoryIdempotencyStore : IIdempotencyStore
+{
+    private class Entry { public PaymentResult Result; public DateTime Expiry; }
+
+    private static readonly Dictionary<string, Entry> _cache = new();
+    private static readonly SemaphoreSlim _lock = new(1, 1);
+
+    public async Task<PaymentResult?> GetAsync(string key)
     {
         await _lock.WaitAsync();
-        try   { return _cache.TryGetValue(key, out var v) ? v : null; }
+        try
+        {
+            if (_cache.TryGetValue(key, out var entry))
+            {
+                if (entry.Expiry > DateTime.UtcNow) return entry.Result;
+                _cache.Remove(key); // expired = treat as miss
+            }
+            return null;
+        }
         finally { _lock.Release(); }
     }
- 
-    public static async Task SetAsync(string key, IActionResult result)
+
+    public async Task SetAsync(string key, PaymentResult result, TimeSpan ttl)
     {
         await _lock.WaitAsync();
-        try   { _cache[key] = result; }
+        try { _cache[key] = new Entry { Result = result, Expiry = DateTime.UtcNow.Add(ttl) }; }
         finally { _lock.Release(); }
     }
 }
- 
-//3. Distributed Lock (prevents parallel duplicate calls)
-//only 1 person can hold it at a time.
+
+
+// IDistributedLockService.cs / InMemoryLockService.cs
+// TTL is enforced. In production: Redis SET NX PX <ttl>,
+// which gives auto-expiry and cross-instance locking for free.
 public interface IDistributedLockService
 {
     Task<bool> AcquireAsync(string resource, TimeSpan ttl);
     Task ReleaseAsync(string resource);
 }
- 
-// Simple in-memory fake lock (replace with Redis SETNX in production)
+
 public class InMemoryLockService : IDistributedLockService
 {
-    private static readonly HashSet<string> _locks = new();
+    private static readonly Dictionary<string, DateTime> _locks = new();
     private static readonly object _obj = new();
- 
+
     public Task<bool> AcquireAsync(string resource, TimeSpan ttl)
     {
         lock (_obj)
         {
-            if (_locks.Contains(resource)) return Task.FromResult(false); // already locked
-            _locks.Add(resource);
+            if (_locks.TryGetValue(resource, out var expiry) && expiry > DateTime.UtcNow)
+                return Task.FromResult(false); // still held by someone else
+
+            _locks[resource] = DateTime.UtcNow.Add(ttl); // acquire (or take over an expired lock)
             return Task.FromResult(true);
         }
     }
- 
+
     public Task ReleaseAsync(string resource)
     {
         lock (_obj) { _locks.Remove(resource); }
         return Task.CompletedTask;
     }
 }
- 
-//4. The Payment Service
+
+
+// Custom exception for non-transient, expected business failures
+// (insufficient funds, account not found) = these are not retried.
+public class PaymentBusinessException : Exception
+{
+    public PaymentBusinessException(string message) : base(message) { }
+}
+
+
+// PaymentService.cs
 public class PaymentService
 {
     private readonly AppDbContext _db;
- 
+
     public PaymentService(AppDbContext db) => _db = db;
- 
-    // This runs inside a DB transaction — all or nothing
+
     public async Task<string> ProcessAsync(PaymentRequest req)
     {
-        // Begin transaction — if anything fails, nothing is saved
         await using var tx = await _db.Database.BeginTransactionAsync();
         try
         {
-            // TODO: deduct from sender, credit receiver, save Payment record
+            var sender = await _db.Accounts
+                .FirstOrDefaultAsync(a => a.AccountNumber == req.FromAccount);
+            var receiver = await _db.Accounts
+                .FirstOrDefaultAsync(a => a.AccountNumber == req.ToAccount);
+
+            if (sender == null || receiver == null)
+                throw new PaymentBusinessException("Sender or receiver account not found.");
+
+            if (sender.Balance < req.Amount)
+                throw new PaymentBusinessException("Insufficient funds.");
+
+            sender.Balance   -= req.Amount;
+            receiver.Balance += req.Amount;
+
             var paymentId = Guid.NewGuid().ToString();
- 
+
+            _db.Payments.Add(new Payment
+            {
+                PaymentId      = paymentId,
+                IdempotencyKey = req.IdempotencyKey,
+                Amount         = req.Amount,
+                Currency       = req.Currency,
+                FromAccount    = req.FromAccount,
+                ToAccount      = req.ToAccount,
+                Status         = "Success",
+                CreatedAt      = DateTime.UtcNow
+            });
+
+            // RowVersion mismatch on sender/receiver -> DbUpdateConcurrencyException,
+            // which is transient and safe to retry.
             await _db.SaveChangesAsync();
-            await tx.CommitAsync(); //everything ok, save it
+            await tx.CommitAsync();
+
             return paymentId;
         }
         catch
         {
-            await tx.RollbackAsync(); //something failed, undo everything
+            await tx.RollbackAsync();
             throw;
         }
     }
 }
- 
-//5.Controller where there is a POST endpoint for /api/payment
+
+
+// PaymentController.cs
 [ApiController]
 [Route("api/[controller]")]
 public class PaymentController : ControllerBase
 {
-    private readonly PaymentService        _paymentService;
+    private readonly PaymentService          _paymentService;
     private readonly IDistributedLockService _lockService;
- 
-    public PaymentController(PaymentService ps, IDistributedLockService ls)
+    private readonly IIdempotencyStore       _idempotencyStore;
+
+    private static readonly TimeSpan LockTtl       = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan CacheTtl      = TimeSpan.FromHours(24);
+    private const int MaxRetries = 3;
+
+    public PaymentController(
+        PaymentService ps,
+        IDistributedLockService ls,
+        IIdempotencyStore idem)
     {
-        _paymentService = ps;
-        _lockService    = ls;
+        _paymentService   = ps;
+        _lockService       = ls;
+        _idempotencyStore  = idem;
     }
- 
+
     [HttpPost]
     public async Task<IActionResult> Pay([FromBody] PaymentRequest req)
     {
-        //Validate idempotency key exists in request
-        if (string.IsNullOrEmpty(req.IdempotencyKey))
-            return BadRequest("IdempotencyKey is required"); // 400
- 
-        //Check if we already processed this exact request
-        var cached = await IdempotencyStore.GetAsync(req.IdempotencyKey);
-        if (cached != null) return cached; // return same response as before (no double charge)
- 
-        //Acquire distributed lock on this idempotency key
-        // Prevents 2 parallel requests with same key from both running
+        if (req == null || string.IsNullOrWhiteSpace(req.IdempotencyKey))
+            return BadRequest("IdempotencyKey is required."); // 400
+
+        if (req.Amount <= 0)
+            return BadRequest("Amount must be greater than zero."); // 400
+
+        // First check — fast path, avoids taking a lock for already-completed requests
+        var cached = await _idempotencyStore.GetAsync(req.IdempotencyKey);
+        if (cached != null) return Replay(cached);
+
         var lockKey = $"payment:{req.IdempotencyKey}";
-        var locked  = await _lockService.AcquireAsync(lockKey, TimeSpan.FromSeconds(30));
+        var locked = await _lockService.AcquireAsync(lockKey, LockTtl);
         if (!locked)
-            return Conflict("Payment already in progress"); // 409
- 
+            return Conflict("Payment already in progress. Please retry shortly."); // 409
+
         try
         {
-            // Check cache again
-            cached = await IdempotencyStore.GetAsync(req.IdempotencyKey);
-            if (cached != null) return cached;
- 
-            //Retry mechanism (try up to 3 times on failure)
-            string? paymentId = null;
-            int maxRetries = 3;
-            for (int attempt = 1; attempt <= maxRetries; attempt++)
+            // Second check closes the race between the first check and acquiring the lock
+            cached = await _idempotencyStore.GetAsync(req.IdempotencyKey);
+            if (cached != null) return Replay(cached);
+
+            string paymentId = null;
+            Exception lastError = null;
+
+            for (int attempt = 1; attempt <= MaxRetries; attempt++)
             {
                 try
                 {
-                    paymentId = await _paymentService.ProcessAsync(req); // runs in DB transaction
-                    break; // success — exit retry loop
+                    paymentId = await _paymentService.ProcessAsync(req);
+                    lastError = null;
+                    break;
                 }
-                catch (Exception ex) when (attempt < maxRetries)
+                catch (PaymentBusinessException)
                 {
-                    // transient error — wait a bit then retry
-                    await Task.Delay(200 * attempt);
+                    // Deterministic failure (insufficient funds, bad account) 
+                    // no retry on these, fails immediately.
+                    throw;
+                }
+                catch (Exception ex) when (attempt < MaxRetries && IsTransient(ex))
+                {
+                    lastError = ex;
+                    await Task.Delay(200 * attempt); // simple backoff
                 }
             }
- 
-            //Save result so duplicate calls return same response
-            var response = Ok(new { PaymentId = paymentId, Status = "Success" }); // 200
-            await IdempotencyStore.SetAsync(req.IdempotencyKey, response);
-            return response;
+
+            if (paymentId == null)
+                throw lastError ?? new Exception("Payment failed after retries.");
+
+            var success = new PaymentResult
+            {
+                PaymentId      = paymentId,
+                Status         = "Success",
+                HttpStatusCode = StatusCodes.Status200OK
+            };
+            await _idempotencyStore.SetAsync(req.IdempotencyKey, success, CacheTtl);
+            return Ok(new { success.PaymentId, success.Status });
+        }
+        catch (PaymentBusinessException ex)
+        {
+            var failed = new PaymentResult
+            {
+                Status         = "Failed",
+                HttpStatusCode = StatusCodes.Status422UnprocessableEntity
+            };
+            // Cache the failure too same idempotency key should keep returning
+            // the same rejection, not silently retry a deduction on every call.
+            await _idempotencyStore.SetAsync(req.IdempotencyKey, failed, CacheTtl);
+            return UnprocessableEntity(new { message = ex.Message }); // 422
         }
         catch (Exception ex)
         {
-            return StatusCode(500, $"Payment failed: {ex.Message}"); // 500
+            // Do NOT cache transient/unexpected failures allow the client to retry
+            // with the same idempotency key once the underlying issue clears.
+            return StatusCode(500, new { message = $"Payment failed: {ex.Message}" }); // 500
         }
         finally
         {
-            // Always release lock — even if something crashed
             await _lockService.ReleaseAsync(lockKey);
         }
     }
+
+    private IActionResult Replay(PaymentResult cached) =>
+        StatusCode(cached.HttpStatusCode, new { cached.PaymentId, cached.Status });
+
+    private static bool IsTransient(Exception ex) =>
+        ex is DbUpdateConcurrencyException
+        || ex is TimeoutException
+        || ex is DbUpdateException; // refine to your provider's actual transient error set
 }

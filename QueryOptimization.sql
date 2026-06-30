@@ -16,17 +16,12 @@ ORDER BY o.OrderDate DESC;
 
 --Indexes to Create
 
--- Speeds up the date-range filter + ORDER BY (same column covers both)
-CREATE INDEX idx_orders_orderdate ON Orders (OrderDate);
+-- 1. Composite index on Orders: covers the date-range WHERE filter, the ORDER BY
+CREATE INDEX idx_orders_date_customer_product 
+ON Orders (OrderDate, CustomerId, ProductId);
 
--- Speeds up the Orders → Customers join
-CREATE INDEX idx_orders_customerid ON Orders (CustomerId);
+-- 2. Composite index on Customers: covers the Country filter AND lets the join back to Orders.CustomerId
+CREATE INDEX idx_customers_country_id 
+ON Customers (Country, Id);
 
--- Speeds up the Orders → Products join
-CREATE INDEX idx_orders_productid ON Orders (ProductId);
-
--- Speeds up filtering Customers by Country
-CREATE INDEX idx_customers_country ON Customers (Country);
-
--- If OrderDate range-filtering and the join to Customers both matter, we could combine into a composite index
-CREATE INDEX idx_orders_date_customer ON Orders (OrderDate, CustomerId);
+-- 3. Products PK is already indexed (assuming Id is PK), so the JOIN Products p ON p.Id = o.ProductId needs no extra index  PK lookups are already O(log n).

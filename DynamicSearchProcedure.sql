@@ -60,6 +60,8 @@ FROM (
 --------------------------------------------------------------------------------------------
 DROP PROCEDURE IF EXISTS sp_SearchOrders;
 
+DELIMITER $$
+
 CREATE DEFINER=`root`@`localhost` PROCEDURE `hr_demo`.`sp_SearchOrders`(
     IN pCustomerName VARCHAR(100),
     IN pDateFrom DATE,
@@ -79,14 +81,14 @@ BEGIN
     DECLARE vSQL TEXT;
     DECLARE vOffset INT;
 
-    SET vOffset = (IFNULL(pPage,1)-1) * IFNULL(pPageSize,20);
+    IF pPageSize IS NULL OR pPageSize <= 0 THEN
+        SET pPageSize = 20;
+    END IF;
+
+    SET vOffset = (IFNULL(pPage,1)-1) * pPageSize;
 
     IF vOffset < 0 THEN
         SET vOffset = 0;
-    END IF;
-
-    IF pPageSize IS NULL OR pPageSize <=0 THEN
-        SET pPageSize = 20;
     END IF;
 
     SET vSQL =
@@ -94,13 +96,13 @@ BEGIN
         o.Id, c.CustomerName, c.Country, c.City, o.OrderDate, o.Amount, o.Status
      FROM Orders o
      INNER JOIN Customers c
-        ON c.Id=o.CustomerId
+        ON c.Id = o.CustomerId
      WHERE 1=1';
 
     IF pCustomerName IS NOT NULL AND pCustomerName <> '' THEN
         SET vSQL = CONCAT(vSQL,
         ' AND c.CustomerName LIKE ',
-        QUOTE(CONCAT('%',pCustomerName,'%')));
+        QUOTE(CONCAT('%', pCustomerName, '%')));
     END IF;
 
     IF pDateFrom IS NOT NULL THEN
@@ -118,39 +120,40 @@ BEGIN
     IF pMinAmount IS NOT NULL THEN
         SET vSQL = CONCAT(vSQL,
         ' AND o.Amount >= ',
-        pMinAmount);
+        QUOTE(pMinAmount));
     END IF;
 
     IF pMaxAmount IS NOT NULL THEN
         SET vSQL = CONCAT(vSQL,
         ' AND o.Amount <= ',
-        pMaxAmount);
+        QUOTE(pMaxAmount));
     END IF;
 
     IF pStatus IS NOT NULL AND pStatus <> '' THEN
         SET vSQL = CONCAT(vSQL,
-        ' AND o.Status=',
+        ' AND o.Status = ',
         QUOTE(pStatus));
     END IF;
 
     IF pCountry IS NOT NULL AND pCountry <> '' THEN
         SET vSQL = CONCAT(vSQL,
-        ' AND c.Country=',
+        ' AND c.Country = ',
         QUOTE(pCountry));
     END IF;
 
     IF pCity IS NOT NULL AND pCity <> '' THEN
         SET vSQL = CONCAT(vSQL,
-        ' AND c.City=',
+        ' AND c.City = ',
         QUOTE(pCity));
     END IF;
 
-    IF pSortBy NOT IN ('CustomerName','OrderDate','Amount','Status') THEN
-        SET pSortBy='OrderDate';
+    -- Fixed: explicit NULL check before whitelist check
+    IF pSortBy IS NULL OR pSortBy NOT IN ('CustomerName','OrderDate','Amount','Status') THEN
+        SET pSortBy = 'OrderDate';
     END IF;
 
-    IF UPPER(pSortDirection) NOT IN ('ASC','DESC') THEN
-        SET pSortDirection='DESC';
+    IF pSortDirection IS NULL OR UPPER(pSortDirection) NOT IN ('ASC','DESC') THEN
+        SET pSortDirection = 'DESC';
     END IF;
 
     SET vSQL =
@@ -165,19 +168,19 @@ BEGIN
         END,
         ' ',
         UPPER(pSortDirection),
-        ' LIMIT ',
-        pPageSize,
-        ' OFFSET ',
-        vOffset
+        ' LIMIT ', pPageSize,
+        ' OFFSET ', vOffset
     );
 
-SET @sql = vSQL;
+    SET @sql = vSQL;
 
-PREPARE stmt FROM @sql;
-EXECUTE stmt;
-DEALLOCATE PREPARE stmt;
+    PREPARE stmt FROM @sql;
+    EXECUTE stmt;
+    DEALLOCATE PREPARE stmt;
 
-END
+END$$
+
+DELIMITER ;
 
 --------------------------------------------------------------------------------------------------------------
 -- Example:
@@ -203,14 +206,11 @@ CALL sp_SearchOrders(NULL,NULL,NULL,1000,5000,NULL,NULL,NULL,'Amount','DESC',1,2
 --------------------------------------------------------------------------------------------------------------------------
 --INDEXES
 CREATE INDEX idx_customers_name ON Customers(CustomerName);
-CREATE INDEX idx_customers_country ON Customers(Country);
-CREATE INDEX idx_customers_city ON Customers(City);
-CREATE INDEX idx_customers_country_city ON Customers(Country, City);
+CREATE INDEX idx_customers_country_city ON Customers(Country, City);  -- covers Country-only lookups too
 
 CREATE INDEX idx_orders_customer ON Orders(CustomerId);
 CREATE INDEX idx_orders_orderdate ON Orders(OrderDate);
 CREATE INDEX idx_orders_amount ON Orders(Amount);
-CREATE INDEX idx_orders_status ON Orders(Status);
-CREATE INDEX idx_orders_status_date ON Orders(Status, OrderDate);
+CREATE INDEX idx_orders_status_date ON Orders(Status, OrderDate);  -- covers Status-only lookups too
 
 ----------------------------------------------------------------------------------------------------------------------------------------

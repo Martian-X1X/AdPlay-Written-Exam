@@ -1,40 +1,37 @@
-// Q14. REACT PERFORMANCE — display 1 million products efficiently
+// Q14. REACT PERFORMANCE = display 1 million products efficiently
 
 import React, {
   useState, useEffect, useCallback, useRef, useMemo
 } from "react";
-import { FixedSizeList as VirtualList } from "react-window"; // virtualization library
+import { FixedSizeList as VirtualList } from "react-window"; // renders only visible rows, not all 1M
 
 
-// 1. DEBOUNCE HOOK
-// "Wait until user stops typing for 400ms, then run"
-// Without this: API call fires on every single keystroke
+// Waits until the user stops typing for 400ms before doing anything.
+// Stops us from firing an API call on every single keystroke.
 function useDebounce(value, delay = 400) {
   const [debounced, setDebounced] = useState(value);
 
   useEffect(() => {
-    const timer = setTimeout(() => setDebounced(value), delay); // set timer
-    return () => clearTimeout(timer); // cancel timer if value changes before delay
+    const timer = setTimeout(() => setDebounced(value), delay);
+    return () => clearTimeout(timer); // if user types again before 400ms, cancel and restart
   }, [value, delay]);
 
   return debounced;
 }
 
 
-// 2. SINGLE PRODUCT ROW (memoized)
-// React.memo = only re-renders if props actually changed
-// Without this: ALL rows re-render when parent state changes
-
+// One row in the list. Wrapped in React.memo so it only
+// re-renders if ITS OWN data changed not every time the parent re-renders for an unrelated reason.
 const ProductRow = React.memo(({ index, style, data }) => {
   const product = data[index];
 
   if (!product) {
-    // Show placeholder while loading next batch
+    // Row hasn't loaded yet (we're still fetching it)
     return <div style={style} className="row loading">Loading...</div>;
   }
 
   return (
-    // "style" from react-window positions the row absolutely — DO NOT remove it
+    // "style" comes from react-window it positions this row  on screen. Don't remove it or rows will overlap/break.
     <div style={style} className="row">
       <span>{product.name}</span>
       <span>${product.price}</span>
@@ -44,107 +41,118 @@ const ProductRow = React.memo(({ index, style, data }) => {
 });
 
 
-// 3. MAIN COMPONENT
-const PAGE_SIZE    = 50;   // load 50 products per API call
-const ROW_HEIGHT   = 50;   // each row is 50px tall (required by react-window)
-const LIST_HEIGHT  = 600;  // visible list window height
+const PAGE_SIZE   = 50;  // how many products we ask for per API call
+const ROW_HEIGHT  = 50;  // height of one row in pixels
+const LIST_HEIGHT = 600; // height of the visible scroll area
 
 export default function ProductList() {
   const [search,   setSearch]   = useState("");
   const [products, setProducts] = useState([]);
-  const [page,     setPage]     = useState(1);
   const [hasMore,  setHasMore]  = useState(true);
   const [loading,  setLoading]  = useState(false);
 
-  // Debounced search — only triggers fetch after user stops typing
   const debouncedSearch = useDebounce(search, 400);
 
-  // Ref to hold the AbortController — lets us cancel in-flight API requests
-  const abortRef = useRef(null);
+  // Refs are used here instead of state for things onScroll needs
+  // to read refs update INSTANTLY, state updates only on the
+  // next render. Scrolling fires fast, so we need instant values
+  // or we'd accidentally fetch the same page twice.
+  const abortRef   = useRef(null); // lets us cancel an old API call
+  const pageRef    = useRef(1);    // which page to fetch next
+  const loadingRef = useRef(false);// are we already fetching right now?
 
-  //FETCH FUNCTION
-  // useCallback = stable function reference, won't re-create on every render
+  // Fetches one page of products from the API.
   const fetchProducts = useCallback(async (searchTerm, pageNum, reset = false) => {
-    // Cancel any previous in-flight request
-    // e.g. user types fast — cancel old search, run new one
+    // If a previous call is still running, cancel it first
+    // e.g. user types fast, we don't want old results to overwrite new ones.
     if (abortRef.current) abortRef.current.abort();
     abortRef.current = new AbortController();
 
     setLoading(true);
+    loadingRef.current = true;
+
     try {
       const res = await fetch(
-        `/api/products?keyword=${searchTerm}&page=${pageNum}&pageSize=${PAGE_SIZE}`,
-        { signal: abortRef.current.signal } // attach cancel signal
+        `/api/products?keyword=${encodeURIComponent(searchTerm)}&page=${pageNum}&pageSize=${PAGE_SIZE}`,
+        { signal: abortRef.current.signal }
       );
       const data = await res.json();
 
       setProducts(prev =>
-        reset
-          ? data.items                  // new search - replace list
-          : [...prev, ...data.items]    // scroll - append to existing list
+        reset ? data.items : [...prev, ...data.items] // new search = replace, scroll = add on
       );
 
-      // If API returned fewer items than page size, no more pages left
+      // Got fewer items than we asked for = we've hit the end of the list
       setHasMore(data.items.length === PAGE_SIZE);
     } catch (err) {
-      if (err.name === "AbortError") return; // request was cancelled — ignore
+      if (err.name === "AbortError") return; // we cancelled it ourselves, ignore
       console.error("Fetch failed:", err);
     } finally {
       setLoading(false);
+      loadingRef.current = false;
     }
   }, []);
 
-  //RESET on new search 
+  // Whenever the search box changes (after the 400ms wait), start fresh.
   useEffect(() => {
-    setProducts([]);   // clear old results
-    setPage(1);        // reset to page 1
-    fetchProducts(debouncedSearch, 1, true); // reset=true - replace list
+    setProducts([]);
+    setHasMore(true);
+    pageRef.current = 1;
+    fetchProducts(debouncedSearch, 1, true);
   }, [debouncedSearch, fetchProducts]);
 
-  //INFINITE SCROLL — load next page 
-  // Called by react-window when user scrolls near the bottom
+  // Fires while scrolling. If we're near the bottom and there's
+  // more data, load the next page.
   const onScroll = useCallback(({ scrollOffset }) => {
-    const totalHeight   = products.length * ROW_HEIGHT;
-    const scrollBottom  = scrollOffset + LIST_HEIGHT;
-    const nearBottom    = scrollBottom >= totalHeight - 200; // 200px before end
+    const totalHeight  = products.length * ROW_HEIGHT;
+    const scrollBottom = scrollOffset + LIST_HEIGHT;
+    const nearBottom   = scrollBottom >= totalHeight - 200; // 200px before the end
 
-    if (nearBottom && hasMore && !loading) {
-      const nextPage = page + 1;
-      setPage(nextPage);
-      fetchProducts(debouncedSearch, nextPage); // load next batch
+    if (nearBottom && hasMore && !loadingRef.current) {
+      const nextPage = pageRef.current + 1;
+      pageRef.current = nextPage; // lock this in right away so a second scroll event can't sneak in and fetch the same page again
+      fetchProducts(debouncedSearch, nextPage);
     }
-  }, [products.length, hasMore, loading, page, debouncedSearch, fetchProducts]);
+  }, [products.length, hasMore, debouncedSearch, fetchProducts]);
 
-  //MEMOIZED item count
-  // useMemo = recalculate only when products/hasMore changes
-  // Adds 1 extra "Loading..." slot at the end while more pages exist
+  // How many "slots" the list should show. Adds 1 extra slot
+  // for a loading placeholder while more pages are still coming.
   const itemCount = useMemo(
     () => hasMore ? products.length + 1 : products.length,
     [products.length, hasMore]
   );
 
+  // If the component disappears (user navigates away) while a
+  // fetch is still running, cancel it so it doesn't try to update
+  // state that no longer exists.
+  useEffect(() => {
+    return () => {
+      if (abortRef.current) abortRef.current.abort();
+    };
+  }, []);
+
   return (
     <div>
-      {/* Search box */}
       <input
         placeholder="Search products..."
         value={search}
-        onChange={e => setSearch(e.target.value)} // debounce handles the delay
+        onChange={e => setSearch(e.target.value)} // the debounce hook handles the delay
       />
       {loading && <span>Loading...</span>}
 
       {/*
-        VIRTUALIZATION via react-window FixedSizeList:
-        Only renders the ~12 rows visible on screen at any time.
-        Without this: rendering 1M <div> nodes = browser crashes.
-        With this: always ~12 DOM nodes regardless of list size.
+        This is what makes 1 million rows possible: react-window
+        only actually puts ~12 rows in the DOM at a time the
+        ones currently visible. As you scroll, it swaps which
+        rows are rendered. Without this, the browser would try
+        to create 1 million <div>s and crash.
       */}
       <VirtualList
-        height={LIST_HEIGHT}   // visible area height
-        itemCount={itemCount}  // total item slots
-        itemSize={ROW_HEIGHT}  // each row height in px
-        itemData={products}    // passed as "data" prop to ProductRow
-        onScroll={onScroll}    // fires on scroll — triggers infinite load
+        height={LIST_HEIGHT}
+        itemCount={itemCount}
+        itemSize={ROW_HEIGHT}
+        itemData={products}
+        onScroll={onScroll}
         width="100%"
       >
         {ProductRow}
@@ -154,10 +162,9 @@ export default function ProductList() {
 }
 
 
-// HOW EACH FEATURE WORKS — SUMMARY
-
-// Virtualization        - react-window only renders visible rows (~12 at a time)
-// Infinite Scrolling    - onScroll detects near-bottom - fetch next page - append
-// Debounced Search      - wait 400ms after typing stops - 1 API call, not 100
-// API Request Cancel    - AbortController cancels stale requests on new search
-// Memoization           - React.memo on rows, useMemo for itemCount, useCallback for functions
+// QUICK SUMMARY OF EACH TRICK USED
+// Virtualization      = only render the rows you can actually see
+// Infinite Scroll      = load more automatically as you near the bottom
+// Debounced Search      = wait for typing to stop before calling the API
+// Request Cancellation  = cancel old API calls when a new one starts
+// Memoization           = avoid re-rendering/re-creating things that didn't change
